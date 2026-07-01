@@ -1,0 +1,864 @@
+// Recording Service - Handles LiveKit Egress API for recording
+
+const { 
+  RoomServiceClient, 
+  EgressClient,
+  EncodedFileOutput,
+  S3Upload
+} = require('livekit-server-sdk');
+const config = require('../config');
+const sessionService = require('./sessionService');
+const recordingStorage = require('./recordingStorage');
+
+class RecordingService {
+  constructor() {
+    this.roomService = new RoomServiceClient(
+      config.livekit.httpUrl,
+      config.livekit.apiKey,
+      config.livekit.apiSecret
+    );
+    this.egressClient = new EgressClient(
+      config.livekit.httpUrl,
+      config.livekit.apiKey,
+      config.livekit.apiSecret
+    );
+  }
+
+  /**
+   * Start recording using TrackEgress (simpler, no PulseAudio required)
+   * Records tracks directly from the room without needing Chrome/PulseAudio
+   * 
+   * @param {string} roomName - The room name to record
+   * @param {string} sessionId - The session ID
+   * @returns {Promise<string>} Egress ID
+   */
+  async startRecordingWithTracks(roomName, sessionId) {
+    try {
+      console.log(`[RecordingService] Starting TrackEgress recording for room: ${roomName}, session: ${sessionId}`);
+
+      // Validate R2 configuration
+      if (!config.r2.accessKeyId || !config.r2.secretAccessKey || !config.r2.bucket || !config.r2.endpoint) {
+        throw new Error('R2 configuration is missing. Please set R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET, and R2_ENDPOINT environment variables.');
+      }
+
+      // Get participants and their audio tracks
+      const participants = await this.roomService.listParticipants(roomName);
+      console.log(`[RecordingService] Room ${roomName} has ${participants?.length || 0} participants`);
+
+      if (!participants || participants.length === 0) {
+        throw new Error(`Room ${roomName} has no participants. Please ensure participants have joined the room before starting recording.`);
+      }
+
+      // Find all audio tracks in the room
+      const audioTracks = [];
+      for (const participant of participants) {
+        const tracks = participant.tracks || [];
+        for (const track of tracks) {
+          if (track.type === 0 && !track.muted) { // AUDIO type = 0
+            audioTracks.push({
+              roomName,
+              participantIdentity: participant.identity,
+              trackId: track.sid,
+            });
+          }
+        }
+      }
+
+      if (audioTracks.length === 0) {
+        throw new Error(`No active audio tracks found in room ${roomName}. Please ensure participants are publishing audio.`);
+      }
+
+      console.log(`[RecordingService] Found ${audioTracks.length} active audio track(s) to record`);
+
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const fileName = `audios/${sessionId}/${sessionId}-${timestamp}.m4a`;
+
+      // Clean endpoint URL
+      let cleanEndpoint = config.r2.endpoint.trim();
+      if (cleanEndpoint.endsWith('/')) {
+        cleanEndpoint = cleanEndpoint.slice(0, -1);
+      }
+      const urlParts = cleanEndpoint.split('/');
+      if (urlParts.length > 3) {
+        cleanEndpoint = urlParts.slice(0, 3).join('/');
+      }
+
+      const r2Region = config.r2.region === 'auto' ? 'us-east-1' : config.r2.region;
+
+      // Create S3Upload instance for R2
+      const s3Upload = new S3Upload({
+        accessKey: config.r2.accessKeyId,
+        secret: config.r2.secretAccessKey,
+        region: r2Region,
+        bucket: config.r2.bucket,
+        endpoint: cleanEndpoint,
+        forcePathStyle: true,
+      });
+
+      // Create file output
+      const fileOutput = new EncodedFileOutput({
+        filepath: fileName,
+        output: {
+          case: 's3',
+          value: s3Upload,
+        },
+      });
+
+      // Record the first audio track (or you can record all tracks)
+      // For simplicity, we'll record the first track
+      const trackToRecord = audioTracks[0];
+      console.log(`[RecordingService] Recording track ${trackToRecord.trackId} from participant ${trackToRecord.participantIdentity}`);
+
+      // Start TrackCompositeEgress - records tracks directly without PulseAudio
+      // This records a single audio track
+      // Method signature: startTrackCompositeEgress(roomName, output, opts?)
+      // opts should have audioTrackId (camelCase) in TrackCompositeOptions
+      const info = await this.egressClient.startTrackCompositeEgress(
+        trackToRecord.roomName,
+        fileOutput, // EncodedFileOutput as second parameter
+        {
+          audioTrackId: trackToRecord.trackId, // TrackCompositeOptions with audioTrackId
+        }
+      );
+
+      console.log("✅ TrackEgress started with ID:", info.egressId);
+      sessionService.setRecording(sessionId, info.egressId);
+      return info.egressId;
+    } catch (error) {
+      console.error("START TRACK RECORDING ERROR:", error);
+      throw new Error(`Failed to start track recording: ${error.message}`);
+    }
+  }
+
+  /**
+   * Start recording a room (audio-only, M4A)
+   * Uses RoomCompositeEgress to record the entire room
+   * Based on official LiveKit examples from Slack
+   * 
+   * NOTE: Requires PulseAudio to be installed on the LiveKit server for audio-only recording
+   * 
+   * @param {string} roomName - The room name to record
+   * @param {string} sessionId - The session ID
+   * @returns {Promise<string>} Egress ID
+   */
+  async startRecording(roomName, sessionId) {
+    try {
+      console.log(`Starting recording for room: ${roomName}, session: ${sessionId}`);
+      console.log(`[RecordingService] LiveKit HTTP URL: ${config.livekit.httpUrl}`);
+      console.log(`[RecordingService] LiveKit WebSocket URL: ${config.livekit.url}`);
+
+      // Validate R2 configuration
+      if (!config.r2.accessKeyId || !config.r2.secretAccessKey || !config.r2.bucket || !config.r2.endpoint) {
+        throw new Error('R2 configuration is missing. Please set R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET, and R2_ENDPOINT environment variables.');
+      }
+
+      // Verify room exists and has participants (RoomCompositeEgress REQUIRES active participants)
+      let participants = [];
+      try {
+        participants = await this.roomService.listParticipants(roomName);
+        console.log(`[RecordingService] Room ${roomName} has ${participants?.length || 0} participants`);
+        
+        if (!participants || participants.length === 0) {
+          throw new Error(`Room ${roomName} has no participants. RoomCompositeEgress requires at least one active participant in the room. Please ensure participants have joined the room before starting recording.`);
+        }
+        
+        // Check if any participant is publishing audio
+        const hasAudio = participants.some(p => {
+          const tracks = p.tracks || [];
+          return tracks.some(t => t.type === 0 && !t.muted); // AUDIO type = 0
+        });
+        
+        if (!hasAudio) {
+          console.warn(`[RecordingService] ⚠️ WARNING: No active audio tracks found in room ${roomName}. Recording may produce empty files or fail.`);
+          console.warn(`[RecordingService] Participants: ${participants.map(p => `${p.identity} (${p.tracks?.length || 0} tracks)`).join(', ')}`);
+        } else {
+          console.log(`[RecordingService] ✅ Room has ${participants.length} participant(s) with active audio tracks. Ready to record.`);
+        }
+        
+        // Add a delay to ensure participants are fully connected and room is stable
+        // RoomCompositeEgress needs participants to be fully established before it can connect
+        // Chrome needs time to establish WebSocket connection to the room
+        console.log(`[RecordingService] Waiting 5 seconds for participants to fully establish connection and room to stabilize...`);
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      } catch (roomError) {
+        // If it's our custom error about no participants, throw it
+        if (roomError.message && roomError.message.includes('no participants')) {
+          throw roomError;
+        }
+        // Otherwise, it might be a connectivity issue
+        console.error(`[RecordingService] ❌ ERROR: Could not verify room participants: ${roomError.message}`);
+        console.error(`[RecordingService] This might indicate the LiveKit server is not accessible at ${config.livekit.httpUrl}`);
+        throw new Error(`Failed to connect to LiveKit room ${roomName}. Please verify the LiveKit server is running and accessible. Error: ${roomError.message}`);
+      }
+
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      // Use .m4a for audio-only recording (AAC encoding)
+      // Files are saved to the 'audios' directory in R2
+      const fileName = `audios/${sessionId}/${sessionId}-${timestamp}.m4a`;
+
+      // Clean endpoint URL (remove trailing slashes and any path)
+      // Endpoint should be: https://<account-id>.r2.cloudflarestorage.com
+      // NOT: https://<account-id>.r2.cloudflarestorage.com/bucket-name
+      let cleanEndpoint = config.r2.endpoint.trim();
+      if (cleanEndpoint.endsWith('/')) {
+        cleanEndpoint = cleanEndpoint.slice(0, -1);
+      }
+      // Remove any path after the domain (bucket name might be in path)
+      const urlParts = cleanEndpoint.split('/');
+      if (urlParts.length > 3) {
+        cleanEndpoint = urlParts.slice(0, 3).join('/');
+      }
+
+      // For Cloudflare R2, use 'us-east-1' region (many S3 clients don't support 'auto')
+      // The endpoint should be the base account endpoint without bucket name
+      const r2Region = config.r2.region === 'auto' ? 'us-east-1' : config.r2.region;
+
+      console.log(`[RecordingService] R2 Configuration:`);
+      console.log(`  Endpoint: ${cleanEndpoint}`);
+      console.log(`  Bucket: ${config.r2.bucket}`);
+      console.log(`  Region: ${r2Region}`);
+      console.log(`  Access Key: ${config.r2.accessKeyId ? config.r2.accessKeyId.substring(0, 8) + '...' : 'NOT SET'}`);
+
+      // Create S3Upload instance for R2 (S3-compatible)
+      const s3Upload = new S3Upload({
+        accessKey: config.r2.accessKeyId,
+        secret: config.r2.secretAccessKey,
+        region: r2Region,
+        bucket: config.r2.bucket,
+        endpoint: cleanEndpoint,
+        forcePathStyle: true, // R2 requires path-style URLs
+      });
+
+      // Create EncodedFileOutput with S3Upload in output.case structure
+      const fileOutput = new EncodedFileOutput({
+        filepath: fileName,
+        output: {
+          case: 's3',
+          value: s3Upload,
+        },
+      });
+
+      console.log("Starting room composite egress with audio-only layout...");
+      console.log(`[RecordingService] ⚠️ IMPORTANT: Ensure your egress.yaml file has ws_url matching: ${config.livekit.url}`);
+      console.log(`[RecordingService] If egress.yaml uses ws://127.0.0.1:7880 but your server is at ${config.livekit.url}, update egress.yaml and restart the egress container.`);
+
+      // Use the correct method signature: startRoomCompositeEgress(roomName, { file }, { layout })
+      // This matches the official LiveKit examples
+      const info = await this.egressClient.startRoomCompositeEgress(
+        roomName,
+        { file: fileOutput },
+        { layout: 'audio-only' }
+      );
+
+      console.log("✅ Egress started with ID:", info.egressId);
+
+      sessionService.setRecording(sessionId, info.egressId);
+
+      return info.egressId;
+    } catch (error) {
+      console.error("START RECORDING ERROR:", error);
+      console.error("Error details:", {
+        message: error.message,
+        stack: error.stack,
+        name: error.name,
+      });
+      
+      // Provide helpful error messages for common issues
+      if (error.message && error.message.includes('pulse')) {
+        throw new Error(`Failed to start recording: PulseAudio is not available on the LiveKit egress service. Audio-only RoomCompositeEgress requires PulseAudio to be installed and running in the egress container. Error: ${error.message}`);
+      }
+      
+      if (error.message && (error.message.includes('Start signal not received') || error.message.includes('connection') || error.message.includes('timeout'))) {
+        throw new Error(`Failed to start recording: The egress service cannot connect to the LiveKit room. This usually means: (1) No participants are in the room, (2) The LiveKit server is not accessible from the egress container, or (3) The WebSocket connection failed. Please verify participants are in the room and the LiveKit server is running. Error: ${error.message}`);
+      }
+      
+      throw new Error(`Failed to start recording: ${error.message}`);
+    }
+  }
+
+  /**
+   * Helper to normalize status (handles both enum numbers and strings)
+   * LiveKit SDK enum values (based on protobuf EgressStatus):
+   * 0 = EGRESS_STARTING
+   * 1 = EGRESS_ACTIVE
+   * 2 = EGRESS_ENDING
+   * 3 = EGRESS_COMPLETE
+   * 4 = EGRESS_FAILED
+   * 5 = EGRESS_ABORTED
+   */
+  normalizeStatus(status) {
+    if (typeof status === 'number') {
+      const statusMap = {
+        0: 'EGRESS_STARTING',
+        1: 'EGRESS_ACTIVE',
+        2: 'EGRESS_ENDING',
+        3: 'EGRESS_COMPLETE',
+        4: 'EGRESS_FAILED',
+        5: 'EGRESS_ABORTED',
+      };
+      return statusMap[status] || `UNKNOWN_${status}`;
+    }
+    return status;
+  }
+
+  /**
+   * Stop recording
+   * @param {string} egressId - The egress ID to stop
+   * @returns {Promise<void>}
+   */
+  async stopRecording(egressId) {
+    try {
+      console.log(`[RecordingService] Stopping recording: ${egressId}`);
+      
+      // Check egress status first
+      const egressList = await this.egressClient.listEgress([egressId]);
+      if (egressList.length === 0) {
+        console.warn(`[RecordingService] Egress ${egressId} not found`);
+        return;
+      }
+      
+      const egress = egressList[0];
+      const rawStatus = egress.status;
+      const status = this.normalizeStatus(rawStatus);
+      
+      console.log(`[RecordingService] Current egress status: ${rawStatus} (${status})`);
+      
+      // Handle different statuses - check failed/aborted FIRST before trying to stop
+      if (status === 'EGRESS_FAILED' || status === 'EGRESS_ABORTED') {
+        console.warn(`[RecordingService] ⚠️ Egress has ${status}. Cannot stop a failed/aborted egress.`);
+        console.warn(`[RecordingService] Error info:`, egress.error || egress.errorReason || 'No error details available');
+        
+        // Handle the failed recording immediately
+        await this.handleRecordingComplete(egressId, egress);
+        return;
+      }
+      
+      if (status === 'EGRESS_COMPLETE') {
+        console.log(`[RecordingService] Egress is already complete. Processing recording completion...`);
+        // Even if already complete, we need to handle it to notify the main backend
+        await this.handleRecordingComplete(egressId, egress);
+        return;
+      }
+      
+      if (status === 'EGRESS_ENDING') {
+        console.log(`[RecordingService] Egress is ending. File should be processing. Will be handled by webhook or polling.`);
+        // Start polling for completion (fallback if webhook doesn't arrive)
+        this.startPollingForCompletion(egressId);
+        return;
+      }
+      
+      if (status === 'EGRESS_ACTIVE' || status === 'EGRESS_STARTING') {
+        console.log(`[RecordingService] Stopping active egress...`);
+        await this.egressClient.stopEgress(egressId);
+        console.log(`[RecordingService] ✅ Recording stop command sent successfully`);
+        console.log(`[RecordingService] LiveKit is now finalizing the file and uploading to R2`);
+        console.log(`[RecordingService] You will receive an 'egress_ended' webhook when the file is saved`);
+        
+        // Start polling for completion (fallback if webhook doesn't arrive)
+        this.startPollingForCompletion(egressId);
+      } else {
+        console.log(`[RecordingService] Egress is in unknown status: ${status} (${rawStatus}). Attempting to stop anyway...`);
+        // Try to stop anyway if status is unknown
+        try {
+          await this.egressClient.stopEgress(egressId);
+          console.log(`[RecordingService] ✅ Stop command sent for status ${status}`);
+        } catch (stopError) {
+          console.warn(`[RecordingService] Could not stop egress with status ${status}:`, stopError.message);
+          // If it failed, check if it's actually a failed egress
+          if (stopError.status === 412 || stopError.code === 'failed_precondition') {
+            console.warn(`[RecordingService] Egress cannot be stopped. It may have already failed.`);
+          }
+        }
+      }
+    } catch (error) {
+      console.error(`[RecordingService] Error stopping recording:`, error);
+      
+      // If it's a "cannot be stopped" error, the egress likely already failed
+      if (error.status === 412 || error.code === 'failed_precondition') {
+        console.warn(`[RecordingService] Egress cannot be stopped (likely already failed). Checking status...`);
+        try {
+          const egressList = await this.egressClient.listEgress([egressId]);
+          if (egressList.length > 0) {
+            const egress = egressList[0];
+            const status = this.normalizeStatus(egress.status);
+            console.warn(`[RecordingService] Egress status: ${egress.status} (${status})`);
+            if (status === 'EGRESS_FAILED' || status === 'EGRESS_ABORTED') {
+              console.warn(`[RecordingService] Egress failed. Error: ${egress.error || 'Unknown error'}`);
+              // Try to handle the failed recording
+              await this.handleRecordingComplete(egressId, egress);
+            }
+          }
+        } catch (statusError) {
+          console.error(`[RecordingService] Error checking egress status:`, statusError);
+        }
+      }
+      
+      // Don't throw - recording might have already stopped or failed
+      console.warn(`[RecordingService] Continuing despite stop error`);
+    }
+  }
+
+  /**
+   * Get recording status
+   * @param {string} egressId
+   * @returns {Promise<Object>}
+   */
+  async getRecordingStatus(egressId) {
+    try {
+      const egress = await this.egressClient.listEgress([egressId]);
+      return egress.length > 0 ? egress[0] : null;
+    } catch (error) {
+      console.error(`[RecordingService] Error getting recording status:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Handle recording completion (called from webhook)
+   * @param {string} egressId
+   * @param {Object} egressInfo
+   */
+  async handleRecordingComplete(egressId, egressInfo) {
+    try {
+      const rawStatus = egressInfo.status || egressInfo.egressStatus;
+      const status = this.normalizeStatus(rawStatus);
+      const isFailed = status === 'EGRESS_FAILED' || status === 'EGRESS_ABORTED';
+      
+      if (isFailed) {
+        console.warn(`[RecordingService] ⚠️ Recording failed: ${egressId}`);
+        console.warn(`[RecordingService] Status: ${status}`);
+        console.warn(`[RecordingService] Error: ${egressInfo.error || egressInfo.errorReason || 'Unknown error'}`);
+      } else {
+        console.log(`[RecordingService] Recording completed: ${egressId}`);
+      }
+      
+      console.log(`[RecordingService] Egress info:`, JSON.stringify(egressInfo, null, 2));
+
+      // Find session by egress ID
+      const sessions = sessionService.getAllSessions();
+      let session = sessions.find(s => s.recordingEgressId === egressId);
+
+      if (!session) {
+        // Try to find session by room name as fallback
+        const roomName = egressInfo.roomName || egressInfo.room_name;
+        if (roomName) {
+          console.log(`[RecordingService] Session not found by egress ID, trying room name: ${roomName}`);
+          session = sessions.find(s => s.sessionId === roomName);
+          if (session) {
+            console.log(`[RecordingService] ✅ Found session by room name: ${roomName}`);
+            // Update the session's egress ID if it doesn't match
+            if (session.recordingEgressId !== egressId) {
+              console.log(`[RecordingService] Updating session egress ID from ${session.recordingEgressId} to ${egressId}`);
+              session.recordingEgressId = egressId;
+            }
+          }
+        }
+        
+        if (!session) {
+          console.warn(`[RecordingService] No session found for egress ID: ${egressId}`);
+          if (roomName) {
+            console.warn(`[RecordingService] Also tried room name: ${roomName}`);
+          }
+          console.warn(`[RecordingService] Available sessions: ${sessions.map(s => `${s.sessionId} (egress: ${s.recordingEgressId})`).join(', ')}`);
+          return;
+        }
+      }
+
+      // Extract file information from egress info
+      // LiveKit automatically uploads the file to R2 when egress ends
+      // For failed egresses, the file may still be uploaded but egress status is failed
+      let fileUrl = null;
+      let fileName = null;
+      
+      // First, try to get fileName from various sources (order matters)
+      // Note: fileName already includes the 'audios/' prefix (e.g., 'audios/taskId/taskId-timestamp.m4a')
+      // 1. Check roomComposite.fileOutputs (most reliable for failed egresses)
+      if (egressInfo.roomComposite && egressInfo.roomComposite.fileOutputs && egressInfo.roomComposite.fileOutputs.length > 0) {
+        fileName = egressInfo.roomComposite.fileOutputs[0].filepath;
+        console.log(`[RecordingService] File name from roomComposite.fileOutputs: ${fileName}`);
+        console.log(`[RecordingService] File path already includes 'audios/' prefix: ${fileName.startsWith('audios/') ? 'Yes' : 'No'}`);
+      }
+      
+      // 2. Check fileResults array (for failed egresses that still have file info)
+      if (!fileName && egressInfo.fileResults && egressInfo.fileResults.length > 0) {
+        fileName = egressInfo.fileResults[0].filename;
+        console.log(`[RecordingService] File name from fileResults: ${fileName}`);
+      }
+      
+      // 3. Check egressInfo.file (standard location)
+      if (!fileName && egressInfo.file) {
+        fileName = egressInfo.file.filename || egressInfo.file.filepath || egressInfo.file.location || egressInfo.file.name;
+        if (fileName) {
+          console.log(`[RecordingService] File name from egress.file: ${fileName}`);
+        }
+      }
+      
+      // Note: LiveKit may save files with .m4a.mp4 extension
+      // We should keep the actual file extension as it exists in R2
+      // Do NOT remove .mp4 extension - the file in R2 has .m4a.mp4, so we need to use that
+      if (fileName && fileName.endsWith('.m4a.mp4')) {
+        console.log(`[RecordingService] File has .m4a.mp4 extension (keeping as-is): ${fileName}`);
+      }
+      
+      // Now construct fileUrl if we have fileName
+      if (fileName) {
+        // If LiveKit provides a direct URL, use it as-is (don't modify the extension)
+        if (egressInfo.file && egressInfo.file.url) {
+          fileUrl = egressInfo.file.url;
+          console.log(`[RecordingService] Using direct URL from LiveKit: ${fileUrl}`);
+        } else if (config.r2.publicUrl) {
+          // Use configured public URL (R2 public bucket URL or custom domain)
+          // fileName already includes 'audios/' prefix - use it as-is (may be .m4a.mp4)
+          const baseUrl = config.r2.publicUrl.replace(/\/$/, '');
+          fileUrl = `${baseUrl}/${fileName}`;
+          console.log(`[RecordingService] Constructed fileUrl from R2 public URL: ${fileUrl}`);
+          console.log(`[RecordingService] Final URL structure: ${baseUrl}/audios/...`);
+        } else if (config.r2.bucket && config.r2.endpoint) {
+          // Fallback: Construct R2 URL based on endpoint
+          const r2Domain = config.r2.endpoint.replace('https://', '').replace('http://', '').split('/')[0];
+          fileUrl = `https://${config.r2.bucket}.${r2Domain}/${fileName}`;
+          console.log(`[RecordingService] Constructed fileUrl from R2 endpoint: ${fileUrl}`);
+        }
+      }
+      
+      // Also check stream info (for stream-based egress)
+      if (!fileUrl && egressInfo.stream) {
+        console.log(`[RecordingService] Stream info found (not file-based egress)`);
+      }
+
+      // Calculate duration
+      const startedAt = session.recordingStartedAt || new Date();
+      const endedAt = new Date();
+      const duration = Math.floor((endedAt - startedAt) / 1000); // Duration in seconds
+
+      // Store recording metadata (even for failed recordings)
+      const recordingData = {
+        sessionId: session.sessionId,
+        startedAt: startedAt,
+        endedAt: endedAt,
+        duration: duration,
+        r2FileUrl: fileUrl,
+        r2FileName: fileName,
+        egressId: egressId,
+        status: status,
+        error: isFailed ? (egressInfo.error || egressInfo.errorReason || 'Unknown error') : null,
+      };
+      
+      const savedRecording = await recordingStorage.saveRecording(recordingData);
+
+      // Clear recording status from session (even if failed)
+      sessionService.clearRecording(session.sessionId);
+
+      if (isFailed) {
+        console.log(`[RecordingService] ⚠️ Recording failed - metadata saved`);
+        console.log(`[RecordingService] Session: ${session.sessionId}`);
+        console.log(`[RecordingService] Error: ${recordingData.error}`);
+        console.log(`[RecordingService] Status: ${status}`);
+      } else {
+        console.log(`[RecordingService] ✅ Recording saved to R2!`);
+        console.log(`[RecordingService] Session: ${session.sessionId}`);
+        console.log(`[RecordingService] File: ${fileName || 'unknown'}`);
+        console.log(`[RecordingService] URL: ${fileUrl || 'N/A'}`);
+        console.log(`[RecordingService] Duration: ${duration} seconds`);
+      }
+      console.log(`[RecordingService] Recording metadata saved with ID: ${savedRecording.id}`);
+
+      // Notify main backend about recording completion (if configured)
+      const mainBackendUrl = config.mainBackend?.webhookUrl || config.mainBackend?.url;
+      if (mainBackendUrl && fileUrl) {
+        const webhookUrl = `${mainBackendUrl}/api/v1/webhooks/recording-complete`;
+        const webhookSecret = config.mainBackend.webhookSecret || config.server.webhookSecret;
+        
+        console.log(`[RecordingService] Notifying main backend: ${webhookUrl}`);
+        console.log(`[RecordingService] Room name (sessionId): ${session.sessionId}`);
+        console.log(`[RecordingService] File URL: ${fileUrl}`);
+        
+        // Retry logic for webhook notification (up to 3 attempts)
+        let lastError = null;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+            
+            const response = await fetch(webhookUrl, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${webhookSecret}`,
+              },
+              body: JSON.stringify({
+                roomName: session.sessionId, // roomName is the sessionId
+                recordingUrl: fileUrl,
+                fileName: fileName,
+                duration: duration,
+              }),
+              signal: controller.signal,
+            });
+            
+            clearTimeout(timeoutId);
+
+            if (response.ok) {
+              const result = await response.json();
+              console.log(`[RecordingService] ✅ Notified main backend about recording completion (attempt ${attempt})`);
+              console.log(`[RecordingService] Main backend response:`, result);
+              lastError = null;
+              break; // Success, exit retry loop
+            } else {
+              const errorText = await response.text().catch(() => 'No error details');
+              lastError = { status: response.status, statusText: response.statusText, body: errorText };
+              console.warn(`[RecordingService] ⚠️ Failed to notify main backend (attempt ${attempt}/${3}): ${response.status} ${response.statusText}`);
+              console.warn(`[RecordingService] Error details:`, errorText);
+              
+              // If it's a 404, the route doesn't exist - don't retry
+              if (response.status === 404) {
+                console.error(`[RecordingService] ❌ Route not found. Ensure the backend is deployed with the latest code including /api/v1/webhooks/recording-complete route.`);
+                break;
+              }
+              
+              // Wait before retrying (exponential backoff)
+              if (attempt < 3) {
+                const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000); // 1s, 2s, 4s max
+                console.log(`[RecordingService] Retrying in ${delay}ms...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+              }
+            }
+          } catch (webhookError) {
+            lastError = webhookError;
+            console.error(`[RecordingService] Error notifying main backend (attempt ${attempt}/${3}):`, webhookError.message || webhookError);
+            
+            // Wait before retrying (exponential backoff)
+            if (attempt < 3) {
+              const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000); // 1s, 2s, 4s max
+              console.log(`[RecordingService] Retrying in ${delay}ms...`);
+              await new Promise(resolve => setTimeout(resolve, delay));
+            }
+          }
+        }
+        
+        if (lastError) {
+          console.error(`[RecordingService] ❌ Failed to notify main backend after 3 attempts. Last error:`, lastError);
+          // Don't fail the recording completion if webhook fails
+        }
+      } else {
+        if (!mainBackendUrl) {
+          console.warn(`[RecordingService] ⚠️ MAIN_BACKEND_URL not configured - skipping webhook notification`);
+        }
+        if (!fileUrl) {
+          console.warn(`[RecordingService] ⚠️ No file URL - skipping webhook notification`);
+          console.warn(`[RecordingService] Debug info: fileName=${fileName || 'none'}, status=${status}, isFailed=${isFailed}`);
+          console.warn(`[RecordingService] Egress info keys:`, Object.keys(egressInfo));
+          if (egressInfo.roomComposite) {
+            console.warn(`[RecordingService] roomComposite.fileOutputs:`, JSON.stringify(egressInfo.roomComposite.fileOutputs, null, 2));
+          }
+          if (egressInfo.fileResults) {
+            console.warn(`[RecordingService] fileResults:`, JSON.stringify(egressInfo.fileResults, null, 2));
+          }
+        }
+      }
+      
+      // For failed egresses, still try to notify if we have a fileUrl
+      // The file might be uploaded even if egress status is failed
+      if (isFailed && fileUrl && mainBackendUrl) {
+        console.log(`[RecordingService] ⚠️ Recording failed but file URL exists. Notifying main backend...`);
+        const webhookUrl = `${mainBackendUrl}/api/v1/webhooks/recording-complete`;
+        const webhookSecret = config.mainBackend.webhookSecret || config.server.webhookSecret;
+        
+        console.log(`[RecordingService] Notifying main backend (failed recording with file): ${webhookUrl}`);
+        console.log(`[RecordingService] Room name (sessionId): ${session.sessionId}`);
+        console.log(`[RecordingService] File URL: ${fileUrl}`);
+        
+        // Retry logic for webhook notification (up to 3 attempts)
+        let lastError = null;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+            
+            const response = await fetch(webhookUrl, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${webhookSecret}`,
+              },
+              body: JSON.stringify({
+                roomName: session.sessionId,
+                recordingUrl: fileUrl,
+                fileName: fileName,
+                duration: duration,
+                status: 'COMPLETED', // Mark as completed since file exists
+              }),
+              signal: controller.signal,
+            });
+            
+            clearTimeout(timeoutId);
+
+            if (response.ok) {
+              const result = await response.json();
+              console.log(`[RecordingService] ✅ Notified main backend about recording (file exists despite failed status) (attempt ${attempt})`);
+              console.log(`[RecordingService] Main backend response:`, result);
+              lastError = null;
+              break; // Success, exit retry loop
+            } else {
+              const errorText = await response.text().catch(() => 'No error details');
+              lastError = { status: response.status, statusText: response.statusText, body: errorText };
+              console.warn(`[RecordingService] ⚠️ Failed to notify main backend (attempt ${attempt}/${3}): ${response.status} ${response.statusText}`);
+              console.warn(`[RecordingService] Error details:`, errorText);
+              
+              // If it's a 404, the route doesn't exist - don't retry
+              if (response.status === 404) {
+                console.error(`[RecordingService] ❌ Route not found. Ensure the backend is deployed with the latest code including /api/v1/webhooks/recording-complete route.`);
+                break;
+              }
+              
+              // Wait before retrying (exponential backoff)
+              if (attempt < 3) {
+                const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000); // 1s, 2s, 4s max
+                console.log(`[RecordingService] Retrying in ${delay}ms...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+              }
+            }
+          } catch (webhookError) {
+            lastError = webhookError;
+            console.error(`[RecordingService] Error notifying main backend (attempt ${attempt}/${3}):`, webhookError.message || webhookError);
+            
+            // Wait before retrying (exponential backoff)
+            if (attempt < 3) {
+              const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000); // 1s, 2s, 4s max
+              console.log(`[RecordingService] Retrying in ${delay}ms...`);
+              await new Promise(resolve => setTimeout(resolve, delay));
+            }
+          }
+        }
+        
+        if (lastError) {
+          console.error(`[RecordingService] ❌ Failed to notify main backend after 3 attempts. Last error:`, lastError);
+        }
+      }
+    } catch (error) {
+      console.error(`[RecordingService] Error handling recording completion:`, error);
+      console.error(`[RecordingService] Error stack:`, error.stack);
+    }
+  }
+
+  /**
+   * Poll for recording completion (fallback if webhook doesn't arrive)
+   * @param {string} egressId
+   */
+  startPollingForCompletion(egressId) {
+    console.log(`[RecordingService] Starting polling for egress ${egressId} completion...`);
+    
+    let pollCount = 0;
+    const maxPolls = 60; // Poll for up to 5 minutes (60 * 5 seconds)
+    const pollInterval = 5000; // Poll every 5 seconds
+    
+    const pollIntervalId = setInterval(async () => {
+      pollCount++;
+      
+      try {
+        const egressList = await this.egressClient.listEgress([egressId]);
+        if (egressList.length === 0) {
+          console.warn(`[RecordingService] Egress ${egressId} not found during polling`);
+          clearInterval(pollIntervalId);
+          return;
+        }
+        
+        // Find the egress with matching ID (listEgress might return multiple or wrong egress)
+        let egress = egressList.find(e => (e.egressId === egressId) || (e.egress_id === egressId));
+        
+        // If no exact match, check the first egress
+        if (!egress) {
+          const firstEgress = egressList[0];
+          const foundId = firstEgress.egressId || firstEgress.egress_id;
+          if (foundId === egressId) {
+            egress = firstEgress;
+          } else {
+            // Wrong egress returned - log error and continue polling
+            console.error(`[RecordingService] ⚠️ WARNING: listEgress returned different egress ID! Expected: ${egressId}, Got: ${foundId}`);
+            console.error(`[RecordingService] This egress belongs to room: ${firstEgress.roomName || firstEgress.room_name || 'unknown'}`);
+            console.error(`[RecordingService] Skipping this egress and continuing to poll for the correct one...`);
+            // Don't process wrong egress - continue polling
+            if (pollCount < maxPolls) {
+              return; // Continue polling
+            } else {
+              // Max polls reached, stop polling
+              clearInterval(pollIntervalId);
+              if (this.pollIntervals) {
+                this.pollIntervals.delete(egressId);
+              }
+              console.error(`[RecordingService] ❌ Max polling attempts reached. Could not find correct egress ${egressId}`);
+              return;
+            }
+          }
+        }
+        
+        const targetEgress = egress;
+        const rawStatus = targetEgress.status;
+        const status = this.normalizeStatus(rawStatus);
+        
+        console.log(`[RecordingService] Poll ${pollCount}/${maxPolls}: Egress ${egressId} status: ${status}`);
+        
+        // Check if recording is complete or failed
+        if (status === 'EGRESS_COMPLETE' || status === 'EGRESS_FAILED' || status === 'EGRESS_ABORTED') {
+          console.log(`[RecordingService] ✅ Egress ${egressId} is ${status}. Handling completion...`);
+          clearInterval(pollIntervalId);
+          
+          // Stop polling tracking
+          if (this.pollIntervals) {
+            this.pollIntervals.delete(egressId);
+          }
+          
+          // Handle completion
+          await this.handleRecordingComplete(egressId, targetEgress);
+          return;
+        }
+        
+        // Stop polling if we've reached max attempts
+        if (pollCount >= maxPolls) {
+          console.warn(`[RecordingService] ⚠️ Max polling attempts reached for egress ${egressId}. Current status: ${status}`);
+          console.warn(`[RecordingService] ⚠️ Webhook may not be configured. Please check LiveKit webhook settings.`);
+          clearInterval(pollIntervalId);
+          
+          // Stop polling tracking
+          if (this.pollIntervals) {
+            this.pollIntervals.delete(egressId);
+          }
+          
+          // Try to handle anyway with current status
+          await this.handleRecordingComplete(egressId, egress);
+        }
+      } catch (error) {
+        console.error(`[RecordingService] Error polling egress status:`, error);
+        
+        // Stop polling on error after max attempts
+        if (pollCount >= maxPolls) {
+          clearInterval(pollIntervalId);
+          if (this.pollIntervals) {
+            this.pollIntervals.delete(egressId);
+          }
+        }
+      }
+    }, pollInterval);
+    
+    // Store interval ID so we can clear it if webhook arrives first
+    if (!this.pollIntervals) {
+      this.pollIntervals = new Map();
+    }
+    this.pollIntervals.set(egressId, pollIntervalId);
+  }
+
+  /**
+   * Stop polling for an egress (called when webhook arrives)
+   * @param {string} egressId
+   */
+  stopPollingForCompletion(egressId) {
+    if (this.pollIntervals && this.pollIntervals.has(egressId)) {
+      clearInterval(this.pollIntervals.get(egressId));
+      this.pollIntervals.delete(egressId);
+      console.log(`[RecordingService] Stopped polling for egress ${egressId} (webhook received)`);
+    }
+  }
+}
+
+module.exports = new RecordingService();
+
+//testing to push and deploy
